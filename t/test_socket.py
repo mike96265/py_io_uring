@@ -37,7 +37,7 @@ class TestSocket(unittest.TestCase):
                 for cast in (bytes, bytearray, memoryview):
                     sqe = ring.get_sqe()
                     d = cast(data)
-                    sqe.prep_send(ssock, d)
+                    sqe.prep_send(ssock.fileno(), d)
                     ring.submit()
                     cqes = ring.wait_cqe_nr(1)
                     self.assertEqual(len(cqes), 1)
@@ -51,7 +51,7 @@ class TestSocket(unittest.TestCase):
         sqe = ring.get_sqe()
         csock = socket(AF_INET, SOCK_STREAM, 0)
         with csock:
-            sqe.prep_connect(csock, self.target_addr)
+            sqe.prep_connect(csock.fileno(), self.target_addr)
             ring.submit()
             ssock, addr = self.server.accept()
             with ssock:
@@ -62,7 +62,7 @@ class TestSocket(unittest.TestCase):
         ring = self.ring
         with self.connect_server() as csock:
             sqe = ring.get_sqe()
-            sqe.prep_accept(self.server)
+            sqe.prep_accept(self.server.fileno())
             ring.submit()
             cqe = ring.wait_cqe()
             cfd = cqe.res()

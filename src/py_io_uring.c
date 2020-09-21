@@ -4,7 +4,6 @@
 #include <liburing.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
-#include "utils.c"
 
 typedef struct {
     PyObject_HEAD
@@ -21,6 +20,7 @@ typedef struct {
     PyObject *allocated_buffer;
     Py_buffer *user_buffer;
     PyObject *data;
+    void *cqeobj;
 } SqeObject;
 
 typedef struct {
@@ -136,6 +136,7 @@ IoUring_wait_cqe_nr_impl(IoUringObject *self, unsigned wait_nr)
     int ret;
     PyObject *rlist;
     CqeObject *cqeobj;
+    SqeObject *sqeobj;
 
     ret = io_uring_wait_cqe_nr(self->ring, &cqes, wait_nr);
 
@@ -146,9 +147,22 @@ IoUring_wait_cqe_nr_impl(IoUringObject *self, unsigned wait_nr)
     rlist = PyList_New(wait_nr);
     for (unsigned i = 0; i < wait_nr; i++) {
         cqe = cqes + i;
-        cqeobj =(CqeObject *) PyObject_CallObject((PyObject *) &CqeType, NULL);
-        cqeobj->cqe = cqe;
-        cqeobj->sqeobj = (SqeObject *) cqe->user_data;
+        sqeobj = (SqeObject *) cqe->user_data;
+        if (sqeobj->cqeobj == NULL) {
+            // we store cqe instance in sqeobj->cqeobj without incref
+            // to make sure only one instance has been initialized
+            // during user keep a reference point to we created last time.
+            // and avoid memory leak, but if last one has been gc,
+            // we create a new one.
+            cqeobj =(CqeObject *) PyObject_CallObject((PyObject *) &CqeType, NULL);
+            cqeobj->cqe = cqe;
+            Py_INCREF(sqeobj);
+            cqeobj->sqeobj = sqeobj;
+            sqeobj->cqeobj = cqeobj;
+        } else {
+            cqeobj = (CqeObject *) sqeobj->cqeobj;
+            Py_INCREF(cqeobj);
+        }
         if (PyList_SetItem(rlist, i, (PyObject *) cqeobj)) {
             Py_DECREF(cqeobj);
             goto error;
@@ -176,13 +190,27 @@ IoUring_wait_single_cqe(IoUringObject *self, unsigned wait_nr)
 {
     struct io_uring_cqe *cqe;
     CqeObject *cqeobj;
+    SqeObject *sqeobj;
     int ret;
     ret = io_uring_wait_cqe_nr(self->ring, &cqe, wait_nr);
     if (ret < 0) {
         errno = -ret;
         return PyErr_SetFromErrno(PyExc_OSError);
     }
-    cqeobj = (CqeObject *) PyObject_CallObject((PyObject *) &CqeType, NULL);
+    sqeobj = (SqeObject *) cqe->user_data;
+    if (sqeobj->cqeobj == NULL) {
+        cqeobj =(CqeObject *) PyObject_CallObject((PyObject *) &CqeType, NULL);
+        if (cqeobj == NULL) {
+            return NULL;
+        }
+        cqeobj->cqe = cqe;
+        Py_INCREF(sqeobj);
+        cqeobj->sqeobj = sqeobj;
+        sqeobj->cqeobj = cqeobj;
+    } else {
+        cqeobj = (CqeObject *) sqeobj->cqeobj;
+        Py_INCREF(cqeobj);
+    }
     if (cqeobj == NULL) {
         return NULL;
     }
@@ -207,11 +235,16 @@ IoUring_peek_cqe(IoUringObject *self)
 static PyObject *
 IoUring_cqe_seen(IoUringObject *self, PyObject *args)
 {
+    // TODO: limit cqe seen called only one time.
     CqeObject *cqe;
-    if (!PyArg_ParseTuple(args, "O", &cqe)) {
+    if (!PyArg_ParseTuple(args, "O:cqe_seen", &cqe)) {
         return NULL;
     }
+    // because we incref sqeobj when we are doing io_uring submit
+    // so we should decref when related cqe has been processed
+    // after cqe_seen this cqe would never be created by wait_cqe
     io_uring_cqe_seen(self->ring, cqe->cqe);
+    Py_DECREF(cqe->sqeobj);
     Py_RETURN_NONE;
 }
 
@@ -259,6 +292,7 @@ Sqe_new(PyTypeObject *type, PyObject *args, PyObject *kwls)
         self->allocated_buffer = NULL;
         self->user_buffer = PyMem_Malloc(sizeof(Py_buffer));
         self->user_buffer->obj = NULL;
+        self->cqeobj = NULL;
     } else {
         return NULL;
     }
@@ -284,13 +318,11 @@ static void Sqe_dealloc(SqeObject *self)
 static PyObject *
 Sqe_prep_send(SqeObject *self, PyObject *args)
 {
-    PyObject *sock;
     char *buf;
     int fd, len, flags = 0;
-    if (!PyArg_ParseTuple(args, "Oy*|i", &sock, self->user_buffer, &flags)) {
+    if (!PyArg_ParseTuple(args, "iy*|i:prep_send", &fd, self->user_buffer, &flags)) {
         return NULL;
     }
-    fd = SockObject_fileno(sock);
     buf = self->user_buffer->buf;
     len = self->user_buffer->len;
     io_uring_prep_send(self->sqe, fd, buf, len, flags);
@@ -300,13 +332,11 @@ Sqe_prep_send(SqeObject *self, PyObject *args)
 static PyObject *
 Sqe_prep_recv(SqeObject *self, PyObject *args)
 {
-    PyObject *sock;
     int fd, len, flags = 0;
 
-    if (!PyArg_ParseTuple(args, "Oi|i:prep_recv", &sock, &len, &flags)) {
+    if (!PyArg_ParseTuple(args, "ii|i:prep_recv", &fd, &len, &flags)) {
         return NULL;
     }
-    fd = SockObject_fileno(sock);
     self->allocated_buffer = PyBytes_FromStringAndSize(NULL, len);
     char *buf = PyBytes_AS_STRING(self->allocated_buffer);
     io_uring_prep_recv(self->sqe, fd, buf, len, flags);
@@ -330,18 +360,16 @@ static PyObject *
 Sqe_prep_connect(SqeObject *self, PyObject *args)
 {
     // TODO: support ipv6 connect
-    PyObject *sockobj, *addrobj;
+    PyObject *addrobj;
     struct sockaddr_in *addr;
     socklen_t addrlen = sizeof(struct sockaddr_in);
     char *ip;
     unsigned port;
     int fd;
-    if (!PyArg_ParseTuple(args, "OO!:connect", &sockobj, &PyTuple_Type, &addrobj)) {
+    if (!PyArg_ParseTuple(args, "iO!:prep_connect", &fd, &PyTuple_Type, &addrobj)) {
         return NULL;
     }
-    fd = SockObject_fileno(sockobj);
-
-    if (!PyArg_ParseTuple(addrobj, "sI:connect", &ip, &port)) {
+    if (!PyArg_ParseTuple(addrobj, "sI:prep_connect", &ip, &port)) {
         return NULL;
     }
 
@@ -358,17 +386,13 @@ static PyObject *
 Sqe_prep_accept(SqeObject *self, PyObject *args)
 {
     // TODO: support ipv6 accept
-    PyObject *sockobj;
     struct sockaddr_in *addr;
     socklen_t *addrlen;
     int fd, flags = 0;
 
-    if (!PyArg_ParseTuple(args, "O|i:accept", &sockobj, &flags)) {
+    if (!PyArg_ParseTuple(args, "i|i:prep_accept", &fd, &flags)) {
         return NULL;
     }
-
-    fd = SockObject_fileno(sockobj);
-
     self->allocated_buffer = PyBytes_FromStringAndSize(NULL, sizeof(struct sockaddr_in) + sizeof(socklen_t));
     addr = (struct sockaddr_in*) PyBytes_AS_STRING(self->allocated_buffer);
     addrlen = (socklen_t *)(addr + 1);
@@ -399,12 +423,10 @@ Sqe_convert_address(SqeObject *self)
 static PyObject *
 Sqe_prep_read(SqeObject *self, PyObject *args)
 {
-    PyObject *fileobj;
     int fd, len, offset;
-    if (!PyArg_ParseTuple(args, "Oi|i:prep_read", &fileobj, &len, &offset)) {
+    if (!PyArg_ParseTuple(args, "ii|i:prep_read", &fd, &len, &offset)) {
         return NULL;
     }
-    fd = SockObject_fileno(fileobj);
     self->allocated_buffer = PyBytes_FromStringAndSize((char *) 0, len);
     char *buf = PyBytes_AS_STRING(self->allocated_buffer);
     io_uring_prep_read(self->sqe, fd, buf, len, offset);
@@ -414,13 +436,11 @@ Sqe_prep_read(SqeObject *self, PyObject *args)
 static PyObject *
 Sqe_prep_write(SqeObject *self, PyObject *args)
 {
-    PyObject *fileobj;
     char *buf;
     int fd, len, offset;
-    if (!PyArg_ParseTuple(args, "Oy*|i:prep_write", &fileobj, self->user_buffer, &offset)) {
+    if (!PyArg_ParseTuple(args, "iy*|i:prep_write", &fd, self->user_buffer, &offset)) {
         return NULL;
     }
-    fd = SockObject_fileno(fileobj);
     buf = self->user_buffer->buf;
     len = self->user_buffer->len;
     io_uring_prep_write(self->sqe, fd, buf, len, offset);
@@ -479,11 +499,10 @@ Sqe_prep_cancel(SqeObject *self, PyObject *args)
 static PyObject *
 Sqe_prep_close(SqeObject *self, PyObject *args)
 {
-    PyObject *fileobj;
-    if (!PyArg_ParseTuple(args, "O:prep_close", &fileobj)) {
+    int fd;
+    if (!PyArg_ParseTuple(args, "i:prep_close", &fd)) {
         return NULL;
     }
-    int fd = SockObject_fileno(fileobj);
     io_uring_prep_close(self->sqe, fd);
     Py_RETURN_NONE;
 }
@@ -498,6 +517,13 @@ Sqe_prep_openat(SqeObject *self, PyObject *args)
 static void
 Cqe_dealloc(CqeObject *self)
 {
+    // when user keep an reference to related sqeobj
+    // the specified sqeobj won't be gc, and also this
+    // cqe may not call cqe_seen method, so we reset sqeobj's
+    // cqeobj field, to allow new one can be created by
+    // wait cqe or peek cqe method without segmentfault
+    // caused by sqeobj's invalid cqeobj pointer
+    self->sqeobj->cqeobj = NULL;
     Py_XDECREF((PyObject *) self->sqeobj);
     Py_TYPE(self)->tp_free((PyObject *) self);
 }
