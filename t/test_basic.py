@@ -17,6 +17,63 @@ class TestBasic(unittest.TestCase):
         ring.queue_init(32, 0)
         self.ring= ring
 
+    def test_sp_ready(self):
+        ring = self.ring
+
+        nready = ring.sq_ready()
+        self.assertEqual(nready, 0)
+
+        sqe = ring.get_sqe()
+        sqe.prep_nop()
+
+        nready = ring.sq_ready()
+        self.assertEqual(nready, 1)
+
+        ring.submit()
+
+        nready = ring.sq_ready()
+        self.assertEqual(nready, 0)
+
+        cqe = ring.wait_cqe()
+        ring.cqe_seen(cqe)
+
+    def test_sp_space_left(self):
+        ring = self.ring
+
+        nleft = ring.sq_space_left()
+        self.assertEqual(nleft, 32)
+
+        sqe = ring.get_sqe()
+        sqe.prep_nop()
+
+        nleft = ring.sq_space_left()
+        self.assertEqual(nleft, 31)
+
+        ring.submit()
+
+        nleft = ring.sq_space_left()
+        self.assertEqual(nleft, 32)
+
+    def test_cq_ready(self):
+        ring = self.ring
+
+        nready = ring.cq_ready()
+        self.assertEqual(nready, 0)
+
+        sqe = ring.get_sqe()
+        sqe.prep_nop()
+        ring.submit()
+        cqe = ring.wait_cqe()
+
+        nready = ring.cq_ready()
+        self.assertEqual(nready, 1)
+
+        ring.cqe_seen(cqe)
+
+        nready = ring.cq_ready()
+        self.assertEqual(nready, 0)
+
+
     def connect_server(self):
         sock = socket(AF_INET, SOCK_STREAM, 0)
         sock.connect(self.target_addr)
@@ -46,15 +103,16 @@ class TestBasic(unittest.TestCase):
         self.assertEqual(cqe.get_data(), self)
 
     def test_prep_timeout(self):
-        print("test prep timeout")
+        print("testing prep timeout, delay: 1s")
         ring = self.ring
         sqe = ring.get_sqe()
-        sqe.prep_timeout(3)
+        sqe.prep_timeout(1)
         start = time.time()
         ring.submit()
         cqe = ring.wait_cqe()
         end = time.time()
         print("start: %s, end: %s, interval: %s" % (start, end, end - start))
+        self.assertEqual(1, int(end - start))
         ring.cqe_seen(cqe)
 
     def tearDown(self):
