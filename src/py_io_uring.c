@@ -27,6 +27,7 @@ typedef struct {
     PyObject_HEAD
     struct io_uring_cqe *cqe;
     SqeObject *sqeobj;
+    bool seen;
 } CqeObject;
 
 static PyTypeObject SqeType, CqeType, IoUringType;
@@ -151,8 +152,8 @@ IoUring_wait_cqe_nr_impl(IoUringObject *self, unsigned wait_nr)
         if (sqeobj->cqeobj == NULL) {
             // we store cqe instance in sqeobj->cqeobj without incref
             // to make sure only one instance has been initialized
-            // during user keep a reference point to we created last time.
-            // and avoid memory leak, but if last one has been gc,
+            // during user keep a reference pointer to cqe created last time.
+            // and avoid memory leak. but if last one has been gc,
             // we create a new one.
             cqeobj =(CqeObject *) PyObject_CallObject((PyObject *) &CqeType, NULL);
             cqeobj->cqe = cqe;
@@ -240,11 +241,14 @@ IoUring_cqe_seen(IoUringObject *self, PyObject *args)
     if (!PyArg_ParseTuple(args, "O:cqe_seen", &cqe)) {
         return NULL;
     }
-    // because we incref sqeobj when we are doing io_uring submit
-    // so we should decref when related cqe has been processed
-    // after cqe_seen this cqe would never be created by wait_cqe
-    io_uring_cqe_seen(self->ring, cqe->cqe);
-    Py_DECREF(cqe->sqeobj);
+    if (!cqe->seen) {
+        // because we incref sqeobj when we are doing io_uring submit
+        // so we should decref when related cqe has been processed
+        // after cqe_seen this cqe would never be created by wait_cqe
+        io_uring_cqe_seen(self->ring, cqe->cqe);
+        cqe->seen = true;
+        Py_DECREF(cqe->sqeobj);
+    }
     Py_RETURN_NONE;
 }
 
@@ -514,6 +518,19 @@ Sqe_prep_openat(SqeObject *self, PyObject *args)
 }
 
 // CqeObject methods definitions
+static PyObject *
+Cqe_new(PyTypeObject *type, PyObject *args, PyObject *kwlist)
+{
+    CqeObject *self;
+    self = (CqeObject *) (type->tp_alloc(type, 0));
+    if (self != NULL) {
+        self->seen = false;
+    } else {
+        return NULL;
+    }
+    return (PyObject*) self;
+}
+
 static void
 Cqe_dealloc(CqeObject *self)
 {
@@ -620,7 +637,7 @@ static PyTypeObject CqeType = {
     .tp_basicsize = sizeof(CqeObject),
     .tp_itemsize= 0,
     .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    .tp_new = PyType_GenericNew,
+    .tp_new = Cqe_new,
     .tp_dealloc = (destructor) Cqe_dealloc,
     .tp_methods = Cqe_methods
 };
