@@ -17,10 +17,10 @@ typedef struct {
     int fd;
     int error;
     int operation;
-    PyObject *allocated_buffer;
-    Py_buffer *user_buffer;
-    PyObject *data;
-    void *cqeobj;
+    PyObject *allocated_buffer; // buffer create by us
+    Py_buffer *user_buffer; // buffer user passed in as parameter
+    PyObject *data; // any object, can be reached cqe.get_data()
+    void *cqeobj; // store related cqe pointer, keep single instance refer by user.
 } SqeObject;
 
 typedef struct {
@@ -42,14 +42,16 @@ static void IoUring_dealloc(IoUringObject *self)
 }
 
 static PyObject *
-IoUring_new(PyTypeObject *type, PyObject *args, PyObject *kwds){
+IoUring_new(PyTypeObject *type, PyObject *args, PyObject *kwargs){
     IoUringObject *self;
     struct io_uring *ring;
+    // we cache unsubmited entries to properly set sqe data field,
+    // so that we can get related sqe object when wait cqe
     PyObject *wait_submit;
 
     self = (IoUringObject *) (type->tp_alloc(type, 0));
 
-    if (self != NULL) {
+    if (self) {
         ring = (struct io_uring *)PyMem_Malloc(sizeof(struct io_uring));
         if (ring != NULL) {
             self->ring = ring;
@@ -57,7 +59,7 @@ IoUring_new(PyTypeObject *type, PyObject *args, PyObject *kwds){
             goto error;
         }
         wait_submit = PyList_New(0);
-        if (wait_submit != NULL) {
+        if (wait_submit) {
             self->wait_submit = wait_submit;
         } else {
             goto error;
@@ -69,6 +71,11 @@ error:
     return (PyObject *) NULL;
 }
 
+PyDoc_STRVAR(
+        get_sqe_doc, 
+        "get_sqe() -> Sqe\n\n"
+        "acquire an Sqe object to describe an operation, return acquired Sqe object.");
+
 static PyObject *
 IoUring_get_sqe(IoUringObject *self)
 {
@@ -76,13 +83,19 @@ IoUring_get_sqe(IoUringObject *self)
     struct io_uring_sqe *sqe;
 
     sqeobj = (SqeObject *) PyObject_CallObject((PyObject *) &SqeType, NULL);
-    if (sqeobj != NULL) {
+    if (sqeobj) {
+        // TODO: get_sqe may got queue full error
         sqe = io_uring_get_sqe(self->ring);
         sqeobj->sqe = sqe;
     }
     PyList_Append(self->wait_submit, (PyObject *) sqeobj);
     return (PyObject *)sqeobj;
 }
+
+PyDoc_STRVAR(
+        queue_init_doc,
+        "queue_init(entries[, flag]) -> None\n\n"
+        "setup an context for perfoming asynchronous IO.");
 
 static PyObject *
 IoUring_queue_init(IoUringObject *self, PyObject *args)
@@ -101,12 +114,22 @@ IoUring_queue_init(IoUringObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        queue_exit_doc,
+        "queue_exit() -> None\n\n"
+        "teardown io_uring instance.");
+
 static PyObject *
 IoUring_queue_exit(IoUringObject *self)
 {
     io_uring_queue_exit(self->ring);
     Py_RETURN_NONE;
 }
+
+PyDoc_STRVAR(
+        submit_doc,
+        "submit() -> int\n\n"
+        "submit operations to kernel, return number of sqes submitted.");
 
 static PyObject *
 IoUring_submit(IoUringObject *self)
@@ -175,6 +198,11 @@ error:
     return NULL;
 }
 
+PyDoc_STRVAR(
+        wait_cqe_nr_doc,
+        "wait_cqe_nr(wait_nr) -> List[Cqe]\n\n"
+        "waiting for wait_nr completions, return a list of completed Cqe Object.");
+
 static PyObject *
 IoUring_wait_cqe_nr(IoUringObject *self, PyObject *args)
 {
@@ -220,11 +248,22 @@ IoUring_wait_single_cqe(IoUringObject *self, unsigned wait_nr)
     return (PyObject *) cqeobj;
 }
 
+PyDoc_STRVAR(
+        wait_cqe_doc,
+        "wait_cqe() -> Cqe\n\n"
+        "waiting for a completion, return the completed Cqe."
+        );
+
 static PyObject *
 IoUring_wait_cqe(IoUringObject *self)
 {
     return IoUring_wait_single_cqe(self, 1);
 }
+
+PyDoc_STRVAR(
+        peek_cqe_doc,
+        "peek_cqe() -> Cqe\n\n"
+        "peek for a completion without waiting, return the completed Cqe or None.");
 
 static PyObject *
 IoUring_peek_cqe(IoUringObject *self)
@@ -232,11 +271,14 @@ IoUring_peek_cqe(IoUringObject *self)
     return IoUring_wait_single_cqe(self, 0);
 }
 
+PyDoc_STRVAR(
+        cqe_seen_doc,
+        "cqe_seen(cqe) -> None\n\n"
+        "mark this Cqe Object as processed. must be called.");
 
 static PyObject *
 IoUring_cqe_seen(IoUringObject *self, PyObject *args)
 {
-    // TODO: limit cqe seen called only one time.
     CqeObject *cqe;
     if (!PyArg_ParseTuple(args, "O:cqe_seen", &cqe)) {
         return NULL;
@@ -252,6 +294,12 @@ IoUring_cqe_seen(IoUringObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        sq_ready_doc,
+        "sq_ready() -> int\n\n"
+        "return number of ready sqe in submition queue."
+        );
+
 static PyObject *
 IoUring_sq_ready(IoUringObject *self)
 {
@@ -260,6 +308,11 @@ IoUring_sq_ready(IoUringObject *self)
     return PyLong_FromLong(nready);
 }
 
+PyDoc_STRVAR(
+        sq_space_left_doc,
+        "sq_space_left() -> int\n\n"
+        "return number of sqe can be acquired in submition queue.");
+
 static PyObject *
 IoUring_sq_space_left(IoUringObject *self)
 {
@@ -267,6 +320,11 @@ IoUring_sq_space_left(IoUringObject *self)
     n = io_uring_sq_space_left(self->ring);
     return PyLong_FromLong(n);
 }
+
+PyDoc_STRVAR(
+        cq_ready_doc,
+        "cq_ready() -> int\n\n"
+        "return the number of completed cqe in completion queue.");
 
 static PyObject *
 IoUring_cq_ready(IoUringObject *self)
@@ -294,7 +352,13 @@ Sqe_new(PyTypeObject *type, PyObject *args, PyObject *kwls)
         self->error = 0;
         self->operation = -1;
         self->allocated_buffer = NULL;
-        self->user_buffer = PyMem_Malloc(sizeof(Py_buffer));
+        Py_buffer *buf = (Py_buffer *) PyMem_Malloc(sizeof(Py_buffer));
+        if (buf != NULL) {
+            self->user_buffer = buf;
+        } else {
+            Py_DECREF(self);
+            return NULL;
+        }
         self->user_buffer->obj = NULL;
         self->cqeobj = NULL;
     } else {
@@ -305,25 +369,39 @@ Sqe_new(PyTypeObject *type, PyObject *args, PyObject *kwls)
     return (PyObject*) self;
 }
 
+static void Sqe_reinit_buffer(SqeObject *self)
+{
+    if (self->user_buffer->obj) {
+        PyBuffer_Release(self->user_buffer);
+        self->user_buffer->obj = NULL;
+    }
+    if (self->allocated_buffer) {
+        Py_DECREF(self->allocated_buffer);
+        self->allocated_buffer = NULL;
+    }
+}
+
 static void Sqe_dealloc(SqeObject *self)
 {
-    if (self->user_buffer->buf != NULL) {
-        PyBuffer_Release(self->user_buffer);
-        PyMem_Free(self->user_buffer);
-    }
-    if (self->allocated_buffer != NULL) {
-        Py_DECREF(self->allocated_buffer);
-    }
+    Sqe_reinit_buffer(self);
+    PyMem_Free(self->user_buffer);
     Py_DECREF(self->data);
     Py_TYPE(self)->tp_free((PyObject *) self);
     return;
 }
+
+PyDoc_STRVAR(
+        prep_send_doc,
+        "prep_send(fd, buf[, flags]) -> None\n\n"
+        "Issue the equivalent of a send(2) system call.");
 
 static PyObject *
 Sqe_prep_send(SqeObject *self, PyObject *args)
 {
     char *buf;
     int fd, len, flags = 0;
+
+    Sqe_reinit_buffer(self);
     if (!PyArg_ParseTuple(args, "iy*|i:prep_send", &fd, self->user_buffer, &flags)) {
         return NULL;
     }
@@ -333,11 +411,17 @@ Sqe_prep_send(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_recv_doc,
+        "prep_recv(fd, len[, flags]) -> None\n\n"
+        "Issue the equivalent of recv(2) system call.");
+
 static PyObject *
 Sqe_prep_recv(SqeObject *self, PyObject *args)
 {
     int fd, len, flags = 0;
 
+    Sqe_reinit_buffer(self);
     if (!PyArg_ParseTuple(args, "ii|i:prep_recv", &fd, &len, &flags)) {
         return NULL;
     }
@@ -347,18 +431,10 @@ Sqe_prep_recv(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
-static PyObject *
-Sqe_set_data(SqeObject *self, PyObject *args)
-{
-    PyObject *data;
-    if (!PyArg_ParseTuple(args, "O:set_data", &data)) {
-        return NULL;
-    }
-    Py_INCREF(data);
-    Py_DECREF(self->data);
-    self->data = data;
-    Py_RETURN_NONE;
-}
+PyDoc_STRVAR(
+        prep_connect_doc,
+        "prep_connect(fd, addr) -> None\n\n"
+        "Issue the equivalent of a connect(2) system call.");
 
 static PyObject *
 Sqe_prep_connect(SqeObject *self, PyObject *args)
@@ -370,6 +446,8 @@ Sqe_prep_connect(SqeObject *self, PyObject *args)
     char *ip;
     unsigned port;
     int fd;
+
+    Sqe_reinit_buffer(self);
     if (!PyArg_ParseTuple(args, "iO!:prep_connect", &fd, &PyTuple_Type, &addrobj)) {
         return NULL;
     }
@@ -386,6 +464,11 @@ Sqe_prep_connect(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_accept_doc,
+        "prep_accept(fd[, flags]) -> None\n\n"
+        "Issue the equivalent of an accept4(2) system call.");
+
 static PyObject *
 Sqe_prep_accept(SqeObject *self, PyObject *args)
 {
@@ -394,6 +477,7 @@ Sqe_prep_accept(SqeObject *self, PyObject *args)
     socklen_t *addrlen;
     int fd, flags = 0;
 
+    Sqe_reinit_buffer(self);
     if (!PyArg_ParseTuple(args, "i|i:prep_accept", &fd, &flags)) {
         return NULL;
     }
@@ -424,10 +508,17 @@ Sqe_convert_address(SqeObject *self)
     return ret;
 }
 
+PyDoc_STRVAR(
+        prep_read_doc,
+        "prep_read(fd, len[, flags]) -> None\n\n"
+        "Issue the equivalent of a read(2) system call.");
+
 static PyObject *
 Sqe_prep_read(SqeObject *self, PyObject *args)
 {
     int fd, len, offset;
+    Sqe_reinit_buffer(self);
+
     if (!PyArg_ParseTuple(args, "ii|i:prep_read", &fd, &len, &offset)) {
         return NULL;
     }
@@ -437,11 +528,18 @@ Sqe_prep_read(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_write_doc,
+        "prep_write(fd, buf[, flags]) -> None\n\n"
+        "Issue the equivalent of a write(2) system call.");
+
 static PyObject *
 Sqe_prep_write(SqeObject *self, PyObject *args)
 {
     char *buf;
     int fd, len, offset;
+
+    Sqe_reinit_buffer(self);
     if (!PyArg_ParseTuple(args, "iy*|i:prep_write", &fd, self->user_buffer, &offset)) {
         return NULL;
     }
@@ -451,6 +549,11 @@ Sqe_prep_write(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_nop_doc,
+        "prep_nop() -> None\n\n"
+        );
+
 static PyObject *
 Sqe_prep_nop(SqeObject *self)
 {
@@ -458,11 +561,18 @@ Sqe_prep_nop(SqeObject *self)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_timeout_doc,
+        "prep_timeout(timeout[, flags]) -> None\n\n"
+        "prepare a timeout operation");
+
 static PyObject *
 Sqe_prep_timeout(SqeObject *self, PyObject *args)
 {
     double timeout;
     unsigned int count= 0, flags = 0;
+
+    Sqe_reinit_buffer(self);
     if (!PyArg_ParseTuple(args, "d|II:prep_timeout", &timeout, &count, &flags)) {
         return NULL;
     }
@@ -474,12 +584,18 @@ Sqe_prep_timeout(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_timeout_remove_doc,
+        "prep_timeout_remove(sqe[, flags]) -> None\n\n"
+        "prepare an attempt to remove an existing timeout operation.");
+
 static PyObject *
 Sqe_prep_timeout_remove(SqeObject *self, PyObject *args)
 {
     // TODO: impl
     SqeObject *timeout;
     unsigned flags = 0;
+
     if (!PyArg_ParseTuple(args, "O!I|prep_timeout_remove", &timeout, &flags)) {
         return NULL;
     }
@@ -487,18 +603,29 @@ Sqe_prep_timeout_remove(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_cancel_doc,
+        "prep_cancel(sqe) -> None\n\n"
+        "prep an operation to cancel submitted operation.");
+
 static PyObject *
 Sqe_prep_cancel(SqeObject *self, PyObject *args)
 {
     // TODO: impl
     SqeObject *cancel;
     unsigned flags = 0;
+
     if (!PyArg_ParseTuple(args, "O!I:prep_cancel", &SqeType, &cancel, &flags)) {
         return NULL;
     }
     io_uring_prep_cancel(self->sqe, cancel, flags);
     Py_RETURN_NONE;
 }
+
+PyDoc_STRVAR(
+        prep_close_doc,
+        "prep_close(fd) -> None\n\n"
+        "prepare an operation to close fd.");
 
 static PyObject *
 Sqe_prep_close(SqeObject *self, PyObject *args)
@@ -511,9 +638,32 @@ Sqe_prep_close(SqeObject *self, PyObject *args)
     Py_RETURN_NONE;
 }
 
+PyDoc_STRVAR(
+        prep_openat_doc,
+        "prep_openat() -> None\n\n"
+        "Issue the equivalent of a openat(2) system call");
+
 static PyObject *
 Sqe_prep_openat(SqeObject *self, PyObject *args)
 {
+    Py_RETURN_NONE;
+}
+
+PyDoc_STRVAR(
+        set_data_doc,
+        "set_data(data) -> None\n\n"
+        "set the data related to this sqe, can be reached by related cqe.");
+
+static PyObject *
+Sqe_set_data(SqeObject *self, PyObject *args)
+{
+    PyObject *data;
+    if (!PyArg_ParseTuple(args, "O:set_data", &data)) {
+        return NULL;
+    }
+    Py_INCREF(data);
+    Py_DECREF(self->data);
+    self->data = data;
     Py_RETURN_NONE;
 }
 
@@ -545,6 +695,11 @@ Cqe_dealloc(CqeObject *self)
     Py_TYPE(self)->tp_free((PyObject *) self);
 }
 
+PyDoc_STRVAR(
+        get_data_doc,
+        "get_data() -> any\n\n"
+        "get data set in related sqe.");
+
 static PyObject *
 Cqe_get_data(CqeObject *self, PyObject *args)
 {
@@ -552,6 +707,11 @@ Cqe_get_data(CqeObject *self, PyObject *args)
     Py_INCREF(data);
     return data;
 }
+
+PyDoc_STRVAR(
+        res_doc,
+        "res() -> int\n\n"
+        "operation res.");
 
 static PyObject *
 Cqe_res(CqeObject *self, PyObject *args)
@@ -562,17 +722,17 @@ Cqe_res(CqeObject *self, PyObject *args)
 // IoUringType definition
 
 static PyMethodDef IoUring_methods[] = {
-    {"get_sqe", (PyCFunction) IoUring_get_sqe, METH_NOARGS, ""},
-    {"queue_init", (PyCFunction) IoUring_queue_init, METH_VARARGS, ""},
-    {"queue_exit", (PyCFunction) IoUring_queue_exit, METH_NOARGS, ""},
-    {"submit", (PyCFunction) IoUring_submit, METH_NOARGS, ""},
-    {"wait_cqe_nr", (PyCFunction) IoUring_wait_cqe_nr, METH_VARARGS, ""},
-    {"wait_cqe", (PyCFunction) IoUring_wait_cqe, METH_NOARGS, ""},
-    {"peek_cqe", (PyCFunction) IoUring_peek_cqe, METH_NOARGS, ""},
-    {"cqe_seen", (PyCFunction) IoUring_cqe_seen, METH_VARARGS, ""},
-    {"sq_ready", (PyCFunction) IoUring_sq_ready, METH_NOARGS, ""},
-    {"sq_space_left", (PyCFunction) IoUring_sq_space_left, METH_NOARGS, ""},
-    {"cq_ready", (PyCFunction) IoUring_cq_ready, METH_NOARGS, ""},
+    {"get_sqe", (PyCFunction) IoUring_get_sqe, METH_NOARGS, get_sqe_doc},
+    {"queue_init", (PyCFunction) IoUring_queue_init, METH_VARARGS, queue_init_doc},
+    {"queue_exit", (PyCFunction) IoUring_queue_exit, METH_NOARGS, queue_exit_doc},
+    {"submit", (PyCFunction) IoUring_submit, METH_NOARGS, submit_doc},
+    {"wait_cqe_nr", (PyCFunction) IoUring_wait_cqe_nr, METH_VARARGS, wait_cqe_nr_doc},
+    {"wait_cqe", (PyCFunction) IoUring_wait_cqe, METH_NOARGS, wait_cqe_doc},
+    {"peek_cqe", (PyCFunction) IoUring_peek_cqe, METH_NOARGS, peek_cqe_doc},
+    {"cqe_seen", (PyCFunction) IoUring_cqe_seen, METH_VARARGS, cqe_seen_doc},
+    {"sq_ready", (PyCFunction) IoUring_sq_ready, METH_NOARGS, sq_ready_doc},
+    {"sq_space_left", (PyCFunction) IoUring_sq_space_left, METH_NOARGS, sq_space_left_doc},
+    {"cq_ready", (PyCFunction) IoUring_cq_ready, METH_NOARGS, cq_ready_doc},
     {"cq_event_fd_enabled", (PyCFunction) IoUring_cq_event_fd_enabled, METH_NOARGS, ""},
     {NULL}
 };
@@ -592,20 +752,20 @@ static PyTypeObject IoUringType = {
 // SqeType definition
 
 static PyMethodDef Sqe_methods[] = {
-    {"prep_recv", (PyCFunction) Sqe_prep_recv, METH_VARARGS, ""},
-    {"prep_send", (PyCFunction) Sqe_prep_send, METH_VARARGS, ""},
-    {"prep_connect", (PyCFunction) Sqe_prep_connect, METH_VARARGS, ""},
-    {"prep_accept", (PyCFunction) Sqe_prep_accept, METH_VARARGS, ""},
-    {"prep_read", (PyCFunction) Sqe_prep_read, METH_VARARGS, ""},
-    {"prep_write", (PyCFunction) Sqe_prep_write, METH_VARARGS, ""},
-    {"set_data", (PyCFunction) Sqe_set_data, METH_VARARGS, ""},
+    {"prep_recv", (PyCFunction) Sqe_prep_recv, METH_VARARGS, prep_recv_doc},
+    {"prep_send", (PyCFunction) Sqe_prep_send, METH_VARARGS, prep_send_doc},
+    {"prep_connect", (PyCFunction) Sqe_prep_connect, METH_VARARGS, prep_connect_doc},
+    {"prep_accept", (PyCFunction) Sqe_prep_accept, METH_VARARGS, prep_accept_doc},
+    {"prep_read", (PyCFunction) Sqe_prep_read, METH_VARARGS, prep_read_doc},
+    {"prep_write", (PyCFunction) Sqe_prep_write, METH_VARARGS, prep_write_doc},
+    {"set_data", (PyCFunction) Sqe_set_data, METH_VARARGS, set_data_doc},
     {"convert_address", (PyCFunction) Sqe_convert_address, METH_NOARGS, ""},
-    {"prep_nop", (PyCFunction) Sqe_prep_nop, METH_NOARGS, ""},
-    {"prep_timeout", (PyCFunction) Sqe_prep_timeout, METH_VARARGS, ""},
-    {"prep_timeout_remove", (PyCFunction) Sqe_prep_timeout_remove, METH_VARARGS, ""},
-    {"prep_close", (PyCFunction) Sqe_prep_close, METH_VARARGS, ""},
-    {"prep_openat", (PyCFunction) Sqe_prep_openat, METH_VARARGS, ""},
-    {"prep_cancel", (PyCFunction) Sqe_prep_cancel, METH_VARARGS, ""},
+    {"prep_nop", (PyCFunction) Sqe_prep_nop, METH_NOARGS, prep_nop_doc},
+    {"prep_timeout", (PyCFunction) Sqe_prep_timeout, METH_VARARGS, prep_timeout_doc},
+    {"prep_timeout_remove", (PyCFunction) Sqe_prep_timeout_remove, METH_VARARGS, prep_timeout_remove_doc},
+    {"prep_close", (PyCFunction) Sqe_prep_close, METH_VARARGS, prep_close_doc},
+    {"prep_openat", (PyCFunction) Sqe_prep_openat, METH_VARARGS, prep_openat_doc},
+    {"prep_cancel", (PyCFunction) Sqe_prep_cancel, METH_VARARGS, prep_cancel_doc},
     {NULL}
 };
 
@@ -624,9 +784,8 @@ static PyTypeObject SqeType  = {
 // CqeType definition
 
 static PyMethodDef Cqe_methods[] = {
-    {"set_data", (PyCFunction) Cqe_get_data, METH_NOARGS, ""},
-    {"res", (PyCFunction) Cqe_res, METH_NOARGS, ""},
-    {"get_data", (PyCFunction) Cqe_get_data, METH_NOARGS, ""},
+    {"res", (PyCFunction) Cqe_res, METH_NOARGS, res_doc},
+    {"get_data", (PyCFunction) Cqe_get_data, METH_NOARGS, get_data_doc},
     {NULL}
 };
 
