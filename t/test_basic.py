@@ -101,6 +101,26 @@ class TestBasic(unittest.TestCase):
         self.assertEqual(1, int(end - start))
         ring.cqe_seen(cqe)
 
+    def test_wait_cqe_nr(self):
+        ring = self.ring
+
+        sqe = ring.get_sqe()
+        sqe.prep_nop()
+        sqe.set_data(1)
+
+        sqe = ring.get_sqe()
+        sqe.prep_nop()
+        sqe.set_data(2)
+
+        ring.submit()
+
+        cqes = ring.wait_cqes(2)
+        self.assertEqual(cqes[0].get_data(), 1)
+        self.assertEqual(cqes[1].get_data(), 2)
+        for cqe in cqes:
+            ring.cqe_seen(cqe)
+
+
     def tearDown(self):
         self.ring.queue_exit()
 

@@ -31,3 +31,5 @@ uvloop/loop.*.pyd
 /.pytest_cache/
 /.mypy_cache/
 .python-version
+*.log
+compile_commands.json
